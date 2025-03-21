@@ -1,11 +1,12 @@
-import Logger, { LoggerWrapper } from '@joplin/utils/Logger';
+import Logger, { LoggerWrapper, TargetType } from '@joplin/utils/Logger';
 import { PluginMessage } from './services/plugins/PluginRunner';
 import AutoUpdaterService, { defaultUpdateInterval, initialUpdateStartup } from './services/autoUpdater/AutoUpdaterService';
 import type ShimType from '@joplin/lib/shim';
 const shim: typeof ShimType = require('@joplin/lib/shim').default;
 import { isCallbackUrl } from '@joplin/lib/callbackUrlUtils';
-
-import { BrowserWindow, Tray, WebContents, screen } from 'electron';
+import { FileLocker } from '@joplin/utils/fs';
+import { IpcMessageHandler, IpcServer, Message, newHttpError, sendMessage, SendMessageOptions, startServer, stopServer } from '@joplin/utils/ipc';
+import { BrowserWindow, Tray, WebContents, screen, App } from 'electron';
 import bridge from './bridge';
 const url = require('url');
 const path = require('path');
@@ -17,6 +18,9 @@ import { _ } from '@joplin/lib/locale';
 import restartInSafeModeFromMain from './utils/restartInSafeModeFromMain';
 import handleCustomProtocols, { CustomProtocolHandler } from './utils/customProtocols/handleCustomProtocols';
 import { clearTimeout, setTimeout } from 'timers';
+import { resolve } from 'path';
+import { defaultWindowId } from '@joplin/lib/reducer';
+import { msleep, Second } from '@joplin/utils/time';
 
 interface RendererProcessQuitReply {
 	canClose: boolean;
@@ -27,33 +31,56 @@ interface PluginWindows {
 	[key: string]: any;
 }
 
-export default class ElectronAppWrapper {
+type SecondaryWindowId = string;
+interface SecondaryWindowData {
+	electronId: number;
+}
 
+export default class ElectronAppWrapper {
 	private logger_: Logger = null;
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Old code before rule was applied
-	private electronApp_: any;
+	private electronApp_: App;
 	private env_: string;
 	private isDebugMode_: boolean;
 	private profilePath_: string;
+
 	private win_: BrowserWindow = null;
+	private mainWindowHidden_ = true;
+	private pluginWindows_: PluginWindows = {};
+	private secondaryWindows_: Map<SecondaryWindowId, SecondaryWindowData> = new Map();
+
 	private willQuitApp_ = false;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Old code before rule was applied
 	private tray_: any = null;
 	private buildDir_: string = null;
 	private rendererProcessQuitReply_: RendererProcessQuitReply = null;
-	private pluginWindows_: PluginWindows = {};
+
 	private initialCallbackUrl_: string = null;
 	private updaterService_: AutoUpdaterService = null;
 	private customProtocolHandler_: CustomProtocolHandler = null;
 	private updatePollInterval_: ReturnType<typeof setTimeout>|null = null;
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Old code before rule was applied
-	public constructor(electronApp: any, env: string, profilePath: string|null, isDebugMode: boolean, initialCallbackUrl: string) {
+	private profileLocker_: FileLocker|null = null;
+	private ipcServer_: IpcServer|null = null;
+	private ipcStartPort_ = 2658;
+
+	private ipcLogger_: Logger;
+
+	public constructor(electronApp: App, env: string, profilePath: string|null, isDebugMode: boolean, initialCallbackUrl: string) {
 		this.electronApp_ = electronApp;
 		this.env_ = env;
 		this.isDebugMode_ = isDebugMode;
 		this.profilePath_ = profilePath;
 		this.initialCallbackUrl_ = initialCallbackUrl;
+
+		this.profileLocker_ = new FileLocker(`${this.profilePath_}/lock`);
+
+		// Note: in certain contexts `this.logger_` doesn't seem to be available, especially for IPC
+		// calls, either because it hasn't been set or other issue. So we set one here specifically
+		// for this.
+		this.ipcLogger_ = new Logger();
+		this.ipcLogger_.addTarget(TargetType.File, {
+			path: `${profilePath}/log-cross-app-ipc.txt`,
+		});
 	}
 
 	public electronApp() {
@@ -68,8 +95,29 @@ export default class ElectronAppWrapper {
 		return this.logger_;
 	}
 
-	public window() {
+	public mainWindow() {
 		return this.win_;
+	}
+
+	public activeWindow() {
+		return BrowserWindow.getFocusedWindow() ?? this.win_;
+	}
+
+	public windowById(joplinId: string) {
+		if (joplinId === defaultWindowId) {
+			return this.mainWindow();
+		}
+
+		const windowData = this.secondaryWindows_.get(joplinId);
+		if (windowData !== undefined) {
+			return BrowserWindow.fromId(windowData.electronId);
+		}
+		return null;
+	}
+
+	public allAppWindows() {
+		const allWindowIds = [...this.secondaryWindows_.keys(), defaultWindowId];
+		return allWindowIds.map(id => this.windowById(id));
 	}
 
 	public env() {
@@ -210,6 +258,15 @@ export default class ElectronAppWrapper {
 			}
 		});
 
+		this.mainWindowHidden_ = !windowOptions.show;
+		this.win_.on('hide', () => {
+			this.mainWindowHidden_ = true;
+		});
+
+		this.win_.on('show', () => {
+			this.mainWindowHidden_ = false;
+		});
+
 		void this.win_.loadURL(url.format({
 			pathname: path.join(__dirname, 'index.html'),
 			protocol: 'file:',
@@ -221,15 +278,25 @@ export default class ElectronAppWrapper {
 		// the easiest is to use a timeout. Keep in mind that if you get a white window on Windows it might be due
 		// to this line though.
 		if (debugEarlyBugs) {
-			setTimeout(() => {
+			// Since a recent release of Electron (v34?), calling openDevTools() here does nothing
+			// if a plugin devtool window is already opened. Maybe because they do a check on
+			// `isDevToolsOpened` which indeed returns `true` (but shouldn't since it's for a
+			// different window). However, if you open the dev tools twice from the Help menu it
+			// works. So instead we do that here and call openDevTool() three times.
+			let openDevToolCount = 0;
+			const openDevToolInterval = setInterval(() => {
 				try {
 					this.win_.webContents.openDevTools();
+					openDevToolCount++;
+					if (openDevToolCount >= 3) {
+						clearInterval(openDevToolInterval);
+					}
 				} catch (error) {
-				// This will throw an exception "Object has been destroyed" if the app is closed
-				// in less that the timeout interval. It can be ignored.
+					// This will throw an exception "Object has been destroyed" if the app is closed
+					// in less that the timeout interval. It can be ignored.
 					console.warn('Error opening dev tools', error);
 				}
-			}, 3000);
+			}, 1000);
 		}
 
 		const addWindowEventHandlers = (webContents: WebContents) => {
@@ -249,6 +316,11 @@ export default class ElectronAppWrapper {
 					// Script-controlled pages: Used for opening notes in new windows
 					return {
 						action: 'allow',
+						overrideBrowserWindowOptions: {
+							webPreferences: {
+								preload: resolve(__dirname, './utils/window/secondaryWindowPreload.js'),
+							},
+						},
 					};
 				} else if (event.url.match(/^https?:\/\//)) {
 					void bridge().openExternal(event.url);
@@ -281,7 +353,8 @@ export default class ElectronAppWrapper {
 					this.hide();
 				}
 			} else {
-				if (this.trayShown() && !this.willQuitApp_) {
+				const hasBackgroundWindows = this.secondaryWindows_.size > 0;
+				if ((hasBackgroundWindows || this.trayShown()) && !this.willQuitApp_) {
 					event.preventDefault();
 					this.win_.hide();
 				} else {
@@ -311,6 +384,26 @@ export default class ElectronAppWrapper {
 			}
 		});
 
+		ipcMain.on('secondary-window-added', (event, windowId: string) => {
+			const window = BrowserWindow.fromWebContents(event.sender);
+			const electronWindowId = window?.id;
+			this.secondaryWindows_.set(windowId, { electronId: electronWindowId });
+
+			// Match the main window's zoom:
+			window.webContents.setZoomFactor(this.mainWindow().webContents.getZoomFactor());
+
+			window.once('close', () => {
+				this.secondaryWindows_.delete(windowId);
+
+				const allSecondaryWindowsClosed = this.secondaryWindows_.size === 0;
+				const mainWindowVisuallyClosed = this.mainWindowHidden_;
+				if (allSecondaryWindowsClosed && mainWindowVisuallyClosed && !this.trayShown()) {
+					// Gracefully quit the app if the user has closed all windows
+					this.win_.close();
+				}
+			});
+		});
+
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Old code before rule was applied
 		ipcMain.on('asynchronous-message', (_event: any, message: string, args: any) => {
 			if (message === 'appCloseReply') {
@@ -333,7 +426,7 @@ export default class ElectronAppWrapper {
 				if (message.target === 'plugin') {
 					const win = this.pluginWindows_[message.pluginId];
 					if (!win) {
-						this.logger().error(`Trying to send IPC message to non-existing plugin window: ${message.pluginId}`);
+						this.ipcLogger_.error(`Trying to send IPC message to non-existing plugin window: ${message.pluginId}`);
 						return;
 					}
 
@@ -388,12 +481,24 @@ export default class ElectronAppWrapper {
 		});
 	}
 
-	public quit() {
+	private onExit() {
 		this.stopPeriodicUpdateCheck();
+		this.profileLocker_.unlockSync();
+
+		// Probably doesn't matter if the server is not closed cleanly? Thus the lack of `await`
+		// eslint-disable-next-line promise/prefer-await-to-then -- Needed here because onExit() is not async
+		void stopServer(this.ipcServer_).catch(_error => {
+			// Ignore it since we're stopping, and to prevent unnecessary messages.
+		});
+	}
+
+	public quit() {
+		this.onExit();
 		this.electronApp_.quit();
 	}
 
 	public exit(errorCode = 0) {
+		this.onExit();
 		this.electronApp_.exit(errorCode);
 	}
 
@@ -442,11 +547,11 @@ export default class ElectronAppWrapper {
 			this.tray_.setContextMenu(contextMenu);
 
 			this.tray_.on('click', () => {
-				if (!this.window()) {
+				if (!this.mainWindow()) {
 					console.warn('The window object was not available during the click event from tray icon');
 					return;
 				}
-				this.window().show();
+				this.mainWindow().show();
 			});
 		} catch (error) {
 			console.error('Cannot create tray', error);
@@ -459,21 +564,27 @@ export default class ElectronAppWrapper {
 		this.tray_ = null;
 	}
 
-	public ensureSingleInstance() {
-		if (this.env_ === 'dev') return false;
+	public async sendCrossAppIpcMessage(message: Message, port: number|null = null, options: SendMessageOptions = null) {
+		this.ipcLogger_.info('Sending message:', message);
 
-		const gotTheLock = this.electronApp_.requestSingleInstanceLock();
+		if (port === null) port = this.ipcStartPort_;
 
-		if (!gotTheLock) {
-			// Another instance is already running - exit
-			this.quit();
-			return true;
+		return await sendMessage(port, { ...message, sourcePort: this.ipcServer_.port }, {
+			logger: this.ipcLogger_,
+			...options,
+		});
+	}
+
+	public async ensureSingleInstance() {
+		// if (this.env_ === 'dev') return false;
+
+		interface OnSecondInstanceMessageData {
+			profilePath: string;
+			argv: string[];
 		}
 
-		// Someone tried to open a second instance - focus our window instead
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Old code before rule was applied
-		this.electronApp_.on('second-instance', (_e: any, argv: string[]) => {
-			const win = this.window();
+		const activateWindow = (argv: string[]) => {
+			const win = this.mainWindow();
 			if (!win) return;
 			if (win.isMinimized()) win.restore();
 			win.show();
@@ -485,9 +596,86 @@ export default class ElectronAppWrapper {
 					void this.openCallbackUrl(url);
 				}
 			}
+		};
+
+		const messageHandlers: Record<string, IpcMessageHandler> = {
+			'onSecondInstance': async (message) => {
+				const data = message.data as OnSecondInstanceMessageData;
+				if (data.profilePath === this.profilePath_) activateWindow(data.argv);
+			},
+
+			'restartAltInstance': async (message) => {
+				if (bridge().altInstanceId()) return false;
+
+				// We do this in a timeout after a short interval because we need this call to
+				// return the response immediately, so that the caller can call `quit()`
+				setTimeout(async () => {
+					const maxWait = 10000;
+					const interval = 300;
+					const loopCount = Math.ceil(maxWait / interval);
+					let callingAppGone = false;
+
+					for (let i = 0; i < loopCount; i++) {
+						const response = await this.sendCrossAppIpcMessage({
+							action: 'ping',
+							data: null,
+						}, message.sourcePort, {
+							sendToSpecificPortOnly: true,
+						});
+
+						if (!response.length) {
+							callingAppGone = true;
+							break;
+						}
+
+						await msleep(interval);
+					}
+
+					if (callingAppGone) {
+						this.ipcLogger_.warn('restartAltInstance: App is gone - restarting it');
+						void bridge().launchNewAppInstance(this.env());
+					} else {
+						this.ipcLogger_.warn('restartAltInstance: Could not restart calling app because it was still open');
+					}
+				}, 100);
+
+				return true;
+			},
+
+			'ping': async (_message) => {
+				return true;
+			},
+		};
+
+		this.ipcServer_ = await startServer(this.ipcStartPort_, async (message) => {
+			if (messageHandlers[message.action]) {
+				this.ipcLogger_.info('Got message:', message);
+				return messageHandlers[message.action](message);
+			}
+
+			throw newHttpError(404);
+		}, {
+			logger: this.ipcLogger_,
 		});
 
-		return false;
+		// First check that no other app is running from that profile folder
+		const gotAppLock = await this.profileLocker_.lock();
+		if (gotAppLock) return false;
+
+		const message: Message = {
+			action: 'onSecondInstance',
+			data: {
+				senderPort: this.ipcServer_.port,
+				profilePath: this.profilePath_,
+				argv: process.argv,
+			},
+		};
+
+		await this.sendCrossAppIpcMessage(message);
+
+		this.quit();
+		if (this.env() === 'dev') console.warn(`Closing the application because another instance is already running, or the previous instance was force-quit within the last ${Math.round(this.profileLocker_.options.interval / Second)} seconds.`);
+		return true;
 	}
 
 	public initializeCustomProtocolHandler(logger: LoggerWrapper) {
@@ -529,7 +717,7 @@ export default class ElectronAppWrapper {
 		// the "ready" event. So we use the function below to make sure that the app is ready.
 		await this.waitForElectronAppReady();
 
-		const alreadyRunning = this.ensureSingleInstance();
+		const alreadyRunning = await this.ensureSingleInstance();
 		if (alreadyRunning) return;
 
 		this.createWindow();

@@ -7,10 +7,12 @@ import { FolderEntity, NoteEntity } from '../database/types';
 import { itemIsReadOnlySync, ItemSlice } from '../../models/utils/readOnly';
 import ItemChange from '../../models/ItemChange';
 import { getTrashFolderId } from '../trash';
+import getActivePluginEditorView from '../plugins/utils/getActivePluginEditorView';
 
 export interface WhenClauseContextOptions {
 	commandFolderId?: string;
 	commandNoteId?: string;
+	windowId?: string;
 }
 
 export interface WhenClauseContext {
@@ -42,6 +44,7 @@ export interface WhenClauseContext {
 	oneNoteSelected: boolean;
 	someNotesSelected: boolean;
 	syncStarted: boolean;
+	hasActivePluginEditor: boolean;
 }
 
 export default function stateToWhenClauseContext(state: State, options: WhenClauseContextOptions = null): WhenClauseContext {
@@ -50,14 +53,17 @@ export default function stateToWhenClauseContext(state: State, options: WhenClau
 		commandNoteId: '',
 		...options,
 	};
+	const windowState = options.windowId ? stateUtils.windowStateById(state, options.windowId) : state;
 
-	const selectedNoteIds = state.selectedNoteIds || [];
+	const selectedNoteIds = windowState.selectedNoteIds || [];
 	const selectedNoteId = selectedNoteIds.length === 1 ? selectedNoteIds[0] : null;
-	const selectedNote: NoteEntity = selectedNoteId ? BaseModel.byId(state.notes, selectedNoteId) : null;
-	const selectedNotes = BaseModel.modelsByIds(state.notes ?? [], selectedNoteIds);
+	const selectedNote: NoteEntity = selectedNoteId ? BaseModel.byId(windowState.notes, selectedNoteId) : null;
+	const selectedNotes = BaseModel.modelsByIds(windowState.notes ?? [], selectedNoteIds);
 
-	const commandFolderId = options.commandFolderId || state.selectedFolderId;
+	const commandFolderId = options.commandFolderId || windowState.selectedFolderId;
 	const commandFolder: FolderEntity = commandFolderId ? BaseModel.byId(state.folders, commandFolderId) : null;
+
+	const { editorPlugin } = state.pluginService ? getActivePluginEditorView(state.pluginService.plugins) : { editorPlugin: null };
 
 	const settings = state.settings || {};
 
@@ -67,8 +73,8 @@ export default function stateToWhenClauseContext(state: State, options: WhenClau
 		syncStarted: state.syncStarted,
 
 		// Current location
-		inConflictFolder: state.selectedFolderId === Folder.conflictFolderId(),
-		inTrash: !!((state.selectedFolderId === getTrashFolderId() && !!selectedNote?.deleted_time) || commandFolder && !!commandFolder.deleted_time),
+		inConflictFolder: windowState.selectedFolderId === Folder.conflictFolderId(),
+		inTrash: !!((windowState.selectedFolderId === getTrashFolderId() && !!selectedNote?.deleted_time) || commandFolder && !!commandFolder.deleted_time),
 
 		// Note selection
 		oneNoteSelected: !!selectedNote,
@@ -80,11 +86,11 @@ export default function stateToWhenClauseContext(state: State, options: WhenClau
 		allSelectedNotesAreDeleted: !selectedNotes.find(n => !n.deleted_time),
 
 		// Note history
-		historyhasBackwardNotes: state.backwardHistoryNotes && state.backwardHistoryNotes.length > 0,
-		historyhasForwardNotes: state.forwardHistoryNotes && state.forwardHistoryNotes.length > 0,
+		historyhasBackwardNotes: windowState.backwardHistoryNotes && windowState.backwardHistoryNotes.length > 0,
+		historyhasForwardNotes: windowState.forwardHistoryNotes && windowState.forwardHistoryNotes.length > 0,
 
 		// Folder selection
-		oneFolderSelected: !!state.selectedFolderId,
+		oneFolderSelected: !!windowState.selectedFolderId,
 
 		// Current note properties
 		noteIsTodo: selectedNote ? !!selectedNote.is_todo : false,
@@ -106,5 +112,7 @@ export default function stateToWhenClauseContext(state: State, options: WhenClau
 		joplinServerConnected: [9, 10].includes(settings['sync.target']),
 		joplinCloudAccountType: settings['sync.target'] === 10 ? settings['sync.10.accountType'] : 0,
 		hasMultiProfiles: state.profileConfig && state.profileConfig.profiles.length > 1,
+
+		hasActivePluginEditor: !!editorPlugin,
 	};
 }

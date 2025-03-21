@@ -4,6 +4,7 @@ import { _electron as electron, Page, ElectronApplication, test as base } from '
 import uuid from '@joplin/lib/uuid';
 import createStartupArgs from './createStartupArgs';
 import firstNonDevToolsWindow from './firstNonDevToolsWindow';
+import setDarkMode from './setDarkMode';
 
 
 type StartWithPluginsResult = { app: ElectronApplication; mainWindow: Page };
@@ -24,19 +25,27 @@ const getAndResizeMainWindow = async (electronApp: ElectronApplication) => {
 
 	// Setting the viewport size helps keep test environments consistent.
 	await mainWindow.setViewportSize({
-		width: 1200,
+		width: 1300,
 		height: 800,
 	});
 
 	return mainWindow;
 };
 
-const waitForStartupPlugins = async (electronApp: ElectronApplication) => {
-	return electronApp.evaluate(({ ipcMain }) => {
+const waitForMainMessage = (electronApp: ElectronApplication, messageId: string) => {
+	return electronApp.evaluate(({ ipcMain }, messageId) => {
 		return new Promise<void>(resolve => {
-			ipcMain.once('startup-plugins-loaded', () => resolve());
+			ipcMain.once(messageId, () => resolve());
 		});
-	});
+	}, messageId);
+};
+
+const waitForAppLoaded = async (electronApp: ElectronApplication) => {
+	await waitForMainMessage(electronApp, 'startup-finished');
+};
+
+const waitForStartupPlugins = async (electronApp: ElectronApplication) => {
+	await waitForMainMessage(electronApp, 'startup-plugins-loaded');
 };
 
 const testDir = dirname(__dirname);
@@ -61,6 +70,9 @@ export const test = base.extend<JoplinFixtures>({
 	electronApp: async ({ profileDirectory }, use) => {
 		const startupArgs = createStartupArgs(profileDirectory);
 		const electronApp = await electron.launch({ args: startupArgs });
+		const startupPromise = waitForAppLoaded(electronApp);
+		await setDarkMode(electronApp, false);
+		await startupPromise;
 
 		await use(electronApp);
 
@@ -83,8 +95,10 @@ export const test = base.extend<JoplinFixtures>({
 					pluginPaths.map(path => resolve(testDir, path)).join(','),
 				],
 			});
+			const startupPromise = waitForAppLoaded(electronApp);
 			const mainWindowPromise = getAndResizeMainWindow(electronApp);
 			await waitForStartupPlugins(electronApp);
+			await startupPromise;
 
 			return {
 				app: electronApp,

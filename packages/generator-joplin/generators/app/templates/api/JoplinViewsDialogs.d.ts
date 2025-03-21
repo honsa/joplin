@@ -1,5 +1,5 @@
 import Plugin from '../Plugin';
-import { ButtonSpec, ViewHandle, DialogResult } from './types';
+import { ButtonSpec, ViewHandle, DialogResult, Toast } from './types';
 /**
  * Allows creating and managing dialogs. A dialog is modal window that
  * contains a webview and a row of buttons. You can update the
@@ -43,6 +43,7 @@ export default class JoplinViewsDialogs {
      * Displays a message box with OK/Cancel buttons. Returns the button index that was clicked - "0" for OK and "1" for "Cancel"
      */
     showMessageBox(message: string): Promise<number>;
+    showToast(toast: Toast): Promise<void>;
     /**
      * Displays a dialog to select a file or a directory. Same options and
      * output as
@@ -64,7 +65,9 @@ export default class JoplinViewsDialogs {
      */
     setButtons(handle: ViewHandle, buttons: ButtonSpec[]): Promise<ButtonSpec[]>;
     /**
-     * Opens the dialog
+     * Opens the dialog.
+     *
+     * On desktop, this closes any copies of the dialog open in different windows.
      */
     open(handle: ViewHandle): Promise<DialogResult>;
     /**

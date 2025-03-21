@@ -31,6 +31,7 @@ import HeaderItem from '../listItemComponents/HeaderItem';
 import AllNotesItem from '../listItemComponents/AllNotesItem';
 import ListItemWrapper from '../listItemComponents/ListItemWrapper';
 import { focus } from '@joplin/lib/utils/focusHandler';
+import shim from '@joplin/lib/shim';
 
 const Menu = bridge().Menu;
 const MenuItem = bridge().MenuItem;
@@ -118,7 +119,7 @@ const useOnRenderItem = (props: Props) => {
 			menu.append(
 				new MenuItem(menuUtils.commandToStatefulMenuItem('emptyTrash')),
 			);
-			menu.popup({ window: bridge().window() });
+			menu.popup({ window: bridge().activeWindow() });
 			return;
 		}
 
@@ -268,7 +269,7 @@ const useOnRenderItem = (props: Props) => {
 			}
 		}
 
-		menu.popup({ window: bridge().window() });
+		menu.popup({ window: bridge().activeWindow() });
 	}, [props.dispatch, pluginsRef]);
 
 
@@ -309,7 +310,7 @@ const useOnRenderItem = (props: Props) => {
 			}
 		} catch (error) {
 			logger.error(error);
-			alert(error.message);
+			await shim.showErrorDialog(error.message);
 		}
 	}, []);
 
@@ -416,6 +417,7 @@ const useOnRenderItem = (props: Props) => {
 				key={item.key}
 				anchorRef={anchorRef}
 				selected={selected}
+				item={item}
 				index={index}
 				itemCount={itemCount}
 			/>;
@@ -424,7 +426,7 @@ const useOnRenderItem = (props: Props) => {
 				<ListItemWrapper
 					key={item.key}
 					containerRef={anchorRef}
-					depth={0}
+					depth={1}
 					selected={selected}
 					itemIndex={index}
 					itemCount={itemCount}

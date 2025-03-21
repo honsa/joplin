@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { AppState } from '../../app.reducer';
 import { FolderEntity, TagsWithNoteCountEntity } from '@joplin/lib/services/database/types';
+import areAllFoldersCollapsed from '@joplin/lib/models/utils/areAllFoldersCollapsed';
 import { PluginStates } from '@joplin/lib/services/plugins/reducer';
 import { connect } from 'react-redux';
 import { Dispatch } from 'redux';
@@ -14,6 +15,7 @@ import useFocusHandler from './hooks/useFocusHandler';
 import useOnRenderItem from './hooks/useOnRenderItem';
 import { ListItem } from './types';
 import useSidebarCommandHandler from './hooks/useSidebarCommandHandler';
+import { stateUtils } from '@joplin/lib/reducer';
 import useOnRenderListWrapper from './hooks/useOnRenderListWrapper';
 
 interface Props {
@@ -39,6 +41,10 @@ const FolderAndTagList: React.FC<Props> = props => {
 		...props,
 		listItems: listItems,
 	});
+
+	const allFoldersCollapsed = useMemo(() => {
+		return areAllFoldersCollapsed(props.folders, props.collapsedFolderIds);
+	}, [props.collapsedFolderIds, props.folders]);
 
 	const listContainerRef = useRef<HTMLDivElement|null>(null);
 	const onRenderItem = useOnRenderItem({
@@ -66,7 +72,7 @@ const FolderAndTagList: React.FC<Props> = props => {
 	const listHeight = useElementHeight(itemListContainer);
 	const listStyle = useMemo(() => ({ height: listHeight }), [listHeight]);
 
-	const onRenderContentWrapper = useOnRenderListWrapper({ selectedIndex, onKeyDown: onKeyEventHandler });
+	const onRenderContentWrapper = useOnRenderListWrapper({ allFoldersCollapsed, selectedIndex, onKeyDown: onKeyEventHandler });
 
 	return (
 		<div
@@ -94,15 +100,17 @@ const FolderAndTagList: React.FC<Props> = props => {
 };
 
 const mapStateToProps = (state: AppState) => {
+	const mainWindowState = stateUtils.mainWindowState(state);
+
 	return {
 		themeId: state.settings.theme,
 		tags: state.tags,
 		folders: state.folders,
-		notesParentType: state.notesParentType,
-		selectedFolderId: state.selectedFolderId,
-		selectedTagId: state.selectedTagId,
+		notesParentType: mainWindowState.notesParentType,
+		selectedFolderId: mainWindowState.selectedFolderId,
+		selectedTagId: mainWindowState.selectedTagId,
 		collapsedFolderIds: state.collapsedFolderIds,
-		selectedSmartFilterId: state.selectedSmartFilterId,
+		selectedSmartFilterId: mainWindowState.selectedSmartFilterId,
 		plugins: state.pluginService.plugins,
 		tagHeaderIsExpanded: state.settings.tagHeaderIsExpanded,
 		folderHeaderIsExpanded: state.settings.folderHeaderIsExpanded,
